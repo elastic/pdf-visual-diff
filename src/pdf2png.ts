@@ -1,8 +1,9 @@
-import * as Canvas from 'canvas'
-import * as assert from 'assert'
+import * as PImage from 'pureimage'
+import { PImageBitmapFactory } from './pure-image-bitmap-factory'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf'
+import { PassThrough } from 'stream'
+import { getDocument, type PDFPageProxy, type PageViewport } from 'pdfjs-dist/legacy/build/pdf.mjs'
 import Jimp, { read } from 'jimp'
 import { mergeImages } from './merge-images'
 
@@ -19,42 +20,6 @@ function convertFromPxToMm(sizePx: number, dpi: number): number {
   }
   const sizeInch = sizePx / dpi
   return Math.round(sizeInch * 25.4)
-}
-
-type CanvasAndContext = {
-  canvas: Canvas.Canvas
-  context: Canvas.CanvasRenderingContext2D
-}
-
-class NodeCanvasFactory {
-  create(width: number, height: number): CanvasAndContext {
-    assert.ok(width > 0 && height > 0, 'Invalid canvas size')
-    const canvas = Canvas.createCanvas(width, height)
-    const context = canvas.getContext('2d')
-    return {
-      canvas,
-      context,
-    }
-  }
-
-  reset(canvasAndContext: CanvasAndContext, width: number, height: number): void {
-    assert.ok(canvasAndContext.canvas, 'Canvas is not specified')
-    assert.ok(width > 0 && height > 0, 'Invalid canvas size')
-    canvasAndContext.canvas.width = width
-    canvasAndContext.canvas.height = height
-  }
-
-  destroy(canvasAndContext: CanvasAndContext): void {
-    assert.ok(canvasAndContext.canvas, 'Canvas is not specified')
-    canvasAndContext.canvas.width = 0
-    canvasAndContext.canvas.height = 0
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
-    canvasAndContext.canvas = null
-    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-    // @ts-ignore
-    canvasAndContext.context = null
-  }
 }
 
 // pdfjs location
@@ -76,7 +41,7 @@ const pdf2PngDefOpts: Pdf2PngOpts = {
   scaleImage: true,
 }
 
-function getPageViewPort(page: pdfjsLib.PDFPageProxy, scaleImage: boolean): pdfjsLib.PageViewport {
+function getPageViewPort(page: PDFPageProxy, scaleImage: boolean): PageViewport {
   const viewport = page.getViewport({ scale: 1.0 })
   if (scaleImage === false) {
     return viewport
@@ -102,32 +67,64 @@ export async function pdf2png(
 
   // Load PDF
   const data = new Uint8Array(Buffer.isBuffer(pdf) ? pdf : fs.readFileSync(pdf))
-  const loadingTask = pdfjsLib.getDocument({
+  const loadingTask = getDocument({
     data,
     cMapUrl: CMAP_URL,
     cMapPacked: CMAP_PACKED,
     standardFontDataUrl: STANDARD_FONT_DATA_URL,
+    CanvasFactory: PImageBitmapFactory,
   })
 
   const pdfDocument = await loadingTask.promise
   const numPages = pdfDocument.numPages
 
-  const canvasFactory = new NodeCanvasFactory()
-  const canvasAndContext = canvasFactory.create(1, 1)
+  const bitmapFactory = new PImageBitmapFactory()
 
   // Generate images
   const images: Buffer[] = []
-  for (let idx = 1; idx <= numPages; idx += 1) {
+
+  for (let idx = 1; idx <= numPages; idx++) {
     const page = await pdfDocument.getPage(idx)
     const viewport = getPageViewPort(page, opts.scaleImage)
-    canvasFactory.reset(canvasAndContext, viewport.width, viewport.height)
+
+    // debugger
+
+    const bitmapAndContext = bitmapFactory.create(
+      Math.ceil(viewport.width),
+      Math.ceil(viewport.height),
+    )
+
     // TODO: fix types
     // eslint-disable-next-line @typescript-eslint/ban-ts-comment
     // @ts-ignore
-    await page.render({ canvasContext: canvasAndContext.context, viewport }).promise
+    await page.render({ canvasContext: bitmapAndContext.context, viewport }).promise
     page.cleanup()
-    const image = canvasAndContext.canvas.toBuffer('image/png')
-    images.push(image)
+
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore
+    const image = []
+    const passThroughStream = new PassThrough()
+    passThroughStream.on('data', (chunk) => image.push(chunk))
+    passThroughStream.on('end', () => {
+      bitmapFactory.destroy(bitmapAndContext)
+      // canvasAndContext.
+    })
+
+    PImage.encodePNGToStream(bitmapAndContext.canvas, passThroughStream)
+    // eslint-disable-next-line @typescript-eslint/ban-ts-comment
+    // @ts-ignore
+    images.push(passThroughStream)
+
+    // images.push(
+    //   new Promise((resolve, reject) => {
+    //     const passThroughStream = new PassThrough()
+    //     passThroughStream.on('data', (chunk) => image.push(chunk))
+    //     passThroughStream.on('end', resolve)
+    //     PassThroughStream.on('error', reject)
+    //     PImage.encodePNGToStream(canvasAndContext.canvas, passThroughStream)
+    //     return passThroughStream
+    //   }),
+    // )
   }
 
   return Promise.all(images.map((x) => read(x)))
